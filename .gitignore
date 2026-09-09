@@ -1,0 +1,25 @@
+# Données générées par les scripts (dépendent de l'utilisateur / de la zone choisie)
+resultats/
+glofas_data/
+glofas_forecast_data/
+cmip6_data/
+
+# Identifiants Copernicus CDS/EWDS - ne jamais versionner
+.cdsapirc
+.cdsapirc.txt
+*.cdsapirc
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Fichiers de travail personnels / brouillons
+Untitled*.ipynb
+*_1.ipynb
+
+# Système
+.DS_Store
+Thumbs.db

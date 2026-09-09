@@ -1,0 +1,28 @@
+name: glofas-ewds
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip>=24
+  - certifi
+  - openssl
+  - numpy
+  - pandas
+  - xarray
+  - cfgrib
+  - eccodes
+  - netcdf4
+  - folium
+  - plotly
+  - matplotlib
+  - geopandas
+  - pyogrio
+  - shapely
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
+  - pip:
+      - cdsapi>=0.7.7

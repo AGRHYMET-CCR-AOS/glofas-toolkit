@@ -1,0 +1,16 @@
+cdsapi>=0.7.7
+numpy
+pandas
+xarray
+netCDF4
+cfgrib
+eccodes
+folium
+plotly
+matplotlib
+geopandas
+pyogrio
+shapely
+jupyterlab
+ipykernel
+ipywidgets
