@@ -46,6 +46,49 @@ Les notebooks sont fournis **sans sorties d'exécution** (cellules à
 ré-exécuter) : ouvrez-les dans JupyterLab (`jupyter lab`, une fois
 l'environnement activé) et lancez les cellules dans l'ordre.
 
+## 0. Installer Anaconda (si ce n'est pas déjà fait)
+
+Ce dépôt suppose que `conda` est disponible dans un terminal PowerShell. Si
+ce n'est pas encore le cas :
+
+1. Téléchargez l'installeur Windows sur
+   [anaconda.com/download](https://www.anaconda.com/download) (Anaconda
+   Distribution, gratuite). Une alternative plus légère et tout aussi
+   fonctionnelle est **Miniconda**
+   ([docs.conda.io/miniconda](https://docs.conda.io/en/latest/miniconda.html)) --
+   les deux fournissent la commande `conda` utilisée ci-dessous ; Anaconda
+   ajoute en plus de nombreux paquets préinstallés (Spyder, Navigator...) non
+   nécessaires pour cet atelier.
+2. Lancez l'installeur : laissez les options par défaut (« Install for Just
+   Me » recommandé, pas besoin de cocher « Add Anaconda to PATH », déconseillé
+   par l'installeur lui-même -- on utilisera **Anaconda Prompt** ou un
+   terminal PowerShell initialisé, voir ci-dessous).
+3. Vérifiez l'installation : ouvrez **« Anaconda Prompt »** depuis le menu
+   Démarrer et lancez :
+
+   ```powershell
+   conda --version
+   ```
+
+4. Pour utiliser `conda` dans un terminal **PowerShell classique** (plutôt
+   que dans « Anaconda Prompt »), initialisez-le une fois :
+
+   ```powershell
+   conda init powershell
+   ```
+
+   puis fermez et rouvrez PowerShell. Si `conda` reste introuvable ensuite,
+   relancez PowerShell **en tant qu'administrateur** et exécutez :
+
+   ```powershell
+   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+   ```
+
+   (nécessaire pour que PowerShell autorise l'exécution du script
+   d'initialisation de conda), puis rouvrez un terminal normal.
+
+Une fois `conda --version` fonctionnel, passez à l'étape suivante.
+
 ## 1. Créer l'environnement Conda
 
 Depuis PowerShell, dans ce dossier :
@@ -97,6 +140,47 @@ généralement pas sous Windows, faute de bibliothèque ecCodes). Vérification 
 conda run -n glofas-ewds python -m cfgrib selfcheck
 conda run -n glofas-ewds python -c "import geopandas; print(geopandas.__version__)"
 ```
+
+### Reproduire un environnement strictement identique (fichier de verrouillage)
+
+`environment.yml` liste les paquets nécessaires sans figer leur version
+exacte : conda choisit alors les versions les plus récentes compatibles au
+moment de l'installation, qui peuvent légèrement différer de celles utilisées
+pour préparer l'atelier. Si vous rencontrez une incompatibilité (comportement
+différent, erreur qu'on n'a pas vue en atelier), vous pouvez exporter votre
+propre environnement tel qu'il tourne réellement chez vous, pour que
+quelqu'un d'autre (ou vous-même, sur une autre machine) puisse recréer
+**exactement** le même :
+
+```powershell
+conda activate glofas-ewds
+conda env export --no-builds > environment-lock.yml
+```
+
+`--no-builds` retire les identifiants de build propres à votre machine
+(compilateur, architecture) tout en gardant les numéros de version exacts :
+le fichier reste réutilisable sur une autre machine Windows avec la même
+architecture. Sans cette option (`conda env export > environment-lock.yml`),
+l'export est encore plus strict (build inclus) mais ne fonctionne alors que
+sur une machine à l'identique de la vôtre -- à réserver au dépannage sur un
+poste très proche du vôtre.
+
+Pour recréer l'environnement à partir de ce fichier :
+
+```powershell
+conda env create -f environment-lock.yml -n glofas-ewds
+```
+
+Ou pour mettre à jour un environnement existant afin qu'il corresponde
+exactement au fichier :
+
+```powershell
+conda env update -n glofas-ewds -f environment-lock.yml --prune
+```
+
+`environment-lock.yml` n'est pas fourni par défaut dans ce dépôt -- générez-le
+vous-même si besoin et ajoutez-le au dépôt (`git add environment-lock.yml`)
+pour le partager avec les autres participants.
 
 ## 2. Configurer l'accès EWDS
 
