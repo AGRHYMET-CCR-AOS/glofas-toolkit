@@ -210,6 +210,33 @@ def resolve_zone(
     return Zone(geometry=geometry, label=label, source=source)
 
 
+def zone_bbox_area(zone: Zone, *, margin_deg: float = 0.0) -> tuple[float, float, float, float]:
+    """Calcule le rectangle englobant de ``zone``, au format ``area`` GloFAS.
+
+    Retourne ``(nord, ouest, sud, est)`` -- directement utilisable comme
+    valeur du paramètre ``area`` de
+    ``glofas_download.download_glofas_discharge`` et
+    ``glofas_forecast.download_glofas_forecast``, pour ne télécharger que
+    l'emprise réelle de la zone d'étude plutôt qu'une boîte saisie à la main.
+
+    ``margin_deg`` (optionnel, ``0`` par défaut) élargit le rectangle de
+    cette valeur, en degrés, de chaque côté -- utile pour ne pas couper la
+    maille GloFAS pile sur le contour de la zone (un sous-bassin dont
+    l'exutoire est proche du bord peut sinon perdre quelques pixels
+    voisins). Le résultat reste toujours borné au domaine global GloFAS
+    (nord <= 90, sud >= -60, ouest >= -180, est <= 180).
+    """
+    if margin_deg < 0:
+        raise ValueError("margin_deg doit être positif ou nul.")
+    west, south, east, north = zone.geometry.bounds
+    return (
+        min(north + margin_deg, 90.0),
+        max(west - margin_deg, -180.0),
+        max(south - margin_deg, -60.0),
+        min(east + margin_deg, 180.0),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Sous-bassins
 # --------------------------------------------------------------------------- #

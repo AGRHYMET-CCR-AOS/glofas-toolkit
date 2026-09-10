@@ -62,9 +62,14 @@ _ID_ALIASES = {"id", "code", "station", "nom", "name", "point", "pointid", "poin
 _LON_ALIASES = {"long", "lon", "longitude", "x", "lng"}
 _LAT_ALIASES = {"lat", "latitude", "y"}
 
-# Motif des fichiers produits par glofas_download.py :
-# glofas_discharge_{year}_{month:02d}.{extension}
+# Motifs des fichiers produits par glofas_download.py :
+# - un seul mois (ancien découpage, ou years_per_request=1 + months=[un seul mois]) :
+#   glofas_discharge_{year}_{month:02d}.{extension}
+# - un groupe de plusieurs mois/années en une seule requête (years_per_request,
+#   voir glofas_download._target_filename) :
+#   glofas_discharge_{year_debut}_{month_debut:02d}_a_{year_fin}_{month_fin:02d}.{extension}
 _FILENAME_RE = re.compile(r"glofas_discharge_(\d{4})_(\d{2})\.(\w+)$")
+_FILENAME_RANGE_RE = re.compile(r"glofas_discharge_(\d{4})_(\d{2})_a_(\d{4})_(\d{2})\.(\w+)$")
 
 _GRIB_EXTENSIONS = {"grib", "grib2", "grb"}
 _NETCDF_EXTENSIONS = {"nc", "netcdf", "nc4"}
@@ -200,7 +205,8 @@ def _parse_period_bound(value: str | int | date | None, *, end: bool) -> date | 
         if len(parts) == 2:
             year, month = int(parts[0]), int(parts[1])
             if end:
-                last_day = 31 if month in (1, 3, 5, 7, 8, 10, 12) else (30 if month != 2 else 29)
+                import calendar
+                last_day = calendar.monthrange(year, month)[1]
                 return date(year, month, last_day)
             return date(year, month, 1)
         year, month, day = (int(p) for p in parts[:3])
@@ -209,13 +215,42 @@ def _parse_period_bound(value: str | int | date | None, *, end: bool) -> date | 
         raise ValueError(f"Format de date non reconnu : {value!r} (attendu YYYY, YYYY-MM ou YYYY-MM-DD)") from exc
 
 
+def _file_coverage(name: str) -> tuple[date, date] | None:
+    """Période (mois de début, mois de fin) couverte par un fichier
+    ``glofas_discharge_...``, d'après son nom -- ``None`` si le nom ne
+    correspond à aucun des deux motifs connus (fichier non pertinent, ignoré
+    par ``find_period_files``).
+
+    Un fichier groupé (``..._a_...``, voir ``glofas_download.py``,
+    ``years_per_request``) peut couvrir uniquement certains mois de chaque
+    année dans sa plage (ex. ``months=[6,7,8]``) : la période retournée ici
+    est l'enveloppe (du premier au dernier mois demandé), pas forcément
+    continue mois par mois. Ce n'est pas un problème de justesse : ça ne
+    peut qu'élargir, jamais réduire, l'ensemble des fichiers sélectionnés
+    pour une période donnée -- le filtrage exact au pas de temps près se
+    fait ensuite sur les horodatages réels du fichier (voir
+    ``extract_glofas_at_points``), pas sur cette enveloppe.
+    """
+    m_range = _FILENAME_RANGE_RE.search(name)
+    if m_range:
+        y1, m1, y2, m2, _ext = m_range.groups()
+        return date(int(y1), int(m1), 1), date(int(y2), int(m2), 1)
+    m = _FILENAME_RE.search(name)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+        month_date = date(year, month, 1)
+        return month_date, month_date
+    return None
+
+
 def find_period_files(
     input_dir: str | Path,
     start: str | int | date | None = None,
     end: str | int | date | None = None,
 ) -> list[Path]:
-    """Liste les fichiers mensuels GloFAS (produits par glofas_download.py)
-    dont le mois est compris dans la période [start, end].
+    """Liste les fichiers GloFAS (produits par glofas_download.py, un mois ou
+    un groupe de plusieurs mois/années par fichier) dont la période couverte
+    chevauche ``[start, end]``.
     """
     input_dir = Path(input_dir)
     if not input_dir.is_dir():
@@ -225,23 +260,25 @@ def find_period_files(
     end_d = _parse_period_bound(end, end=True)
     if start_d and end_d and start_d > end_d:
         raise ValueError(f"La date de début ({start_d}) est postérieure à la date de fin ({end_d})")
+    query_start = date(start_d.year, start_d.month, 1) if start_d else None
+    query_end = date(end_d.year, end_d.month, 1) if end_d else None
 
     matches: list[tuple[date, Path]] = []
     for candidate in sorted(input_dir.iterdir()):
-        m = _FILENAME_RE.search(candidate.name)
-        if not m:
+        coverage = _file_coverage(candidate.name)
+        if coverage is None:
             continue
-        year, month = int(m.group(1)), int(m.group(2))
-        month_date = date(year, month, 1)
-        if start_d and month_date < date(start_d.year, start_d.month, 1):
+        file_start, file_end = coverage
+        if query_start and file_end < query_start:
             continue
-        if end_d and month_date > date(end_d.year, end_d.month, 1):
+        if query_end and file_start > query_end:
             continue
-        matches.append((month_date, candidate))
+        matches.append((file_start, candidate))
 
     if not matches:
         raise FileNotFoundError(
-            f"Aucun fichier 'glofas_discharge_YYYY_MM.*' trouvé dans {input_dir} "
+            f"Aucun fichier 'glofas_discharge_YYYY_MM.*' (ou groupé, "
+            f"'glofas_discharge_YYYY_MM_a_YYYY_MM.*') trouvé dans {input_dir} "
             f"pour la période demandée ({start!r} -> {end!r})."
         )
     matches.sort(key=lambda item: item[0])

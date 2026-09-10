@@ -10,7 +10,6 @@ Il faut également avoir accepté la licence du jeu de données dans le portail.
 from __future__ import annotations
 
 import argparse
-import calendar
 import logging
 import os
 import random
@@ -35,6 +34,8 @@ class DownloadResult:
     month: int
     path: Path
     status: str  # "downloaded" ou "skipped"
+    year_end: int | None = None  # dernière année couverte (requêtes groupées, voir years_per_request)
+    month_end: int | None = None  # dernier mois couvert (idem)
 
 
 def _normalise_ints(values: Iterable[int | str], minimum: int, maximum: int, name: str) -> list[int]:
@@ -138,8 +139,49 @@ def _make_client() -> Any:
     return cdsapi.Client()
 
 
-def _download_glofas_discharge_year(
-    year: int | str,
+def _batch_years(years: list[int], years_per_request: int) -> list[list[int]]:
+    """Regroupe une liste d'années (triée, sans doublon) en groupes d'années
+    **consécutives**, de taille au plus ``years_per_request``.
+
+    Ne regroupe jamais des années non consécutives dans le même groupe (même
+    si ``years_per_request`` le permettrait) : le nom de fichier produit pour
+    un groupe encode sa plage ``année_début-année_fin`` (voir
+    ``_target_filename``), qui ne serait plus fiable pour la reprise/la
+    sélection des fichiers en aval (``glofas_extract.find_period_files``) si
+    la plage contenait un trou.
+    """
+    if years_per_request < 1:
+        raise ValueError("years_per_request doit être supérieur ou égal à 1")
+    batches: list[list[int]] = []
+    current: list[int] = []
+    for y in years:
+        if current and (y != current[-1] + 1 or len(current) >= years_per_request):
+            batches.append(current)
+            current = []
+        current.append(y)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _target_filename(years: list[int], months: list[int], extension: str) -> str:
+    """Nom de fichier pour un groupe d'années/mois demandés en une requête.
+
+    Un groupe d'une seule année et d'un seul mois reprend exactement l'ancien
+    nommage ``glofas_discharge_{année}_{mois}.{ext}`` (rétrocompatible avec
+    les fichiers déjà téléchargés avant ce correctif -- ``glofas_extract.py``
+    continue de les reconnaître). Un groupe plus large est nommé par sa plage
+    ``glofas_discharge_{année_début}_{mois_début}_a_{année_fin}_{mois_fin}.{ext}``.
+    """
+    y1, y2 = years[0], years[-1]
+    m1, m2 = months[0], months[-1]
+    if y1 == y2 and m1 == m2:
+        return f"glofas_discharge_{y1}_{m1:02d}.{extension}"
+    return f"glofas_discharge_{y1}_{m1:02d}_a_{y2}_{m2:02d}.{extension}"
+
+
+def _download_glofas_discharge_batch(
+    years: list[int],
     *,
     months: Iterable[int | str] = range(1, 13),
     area: Sequence[float] = (90, -180, -60, 180),
@@ -156,14 +198,21 @@ def _download_glofas_discharge_year(
     overwrite: bool = False,
     client: Any | None = None,
 ) -> list[DownloadResult]:
-    """Télécharge une année en fichiers mensuels, avec reprise et contrôle d'intégrité.
+    """Télécharge un groupe d'années **consécutives** en une seule requête EWDS.
 
-    Le découpage mensuel limite la taille des requêtes et permet de reprendre un
-    téléchargement interrompu sans recommencer toute l'année.
+    Contrairement à l'ancien découpage mensuel (une requête par mois), tous
+    les mois sélectionnés pour toutes les années du groupe sont demandés en
+    un seul appel ``api.retrieve`` -- réduit fortement le nombre de requêtes,
+    au prix d'une reprise moins fine (toute la requête est retentée en cas
+    d'échec, pas seulement un mois) et d'une requête plus volumineuse (voir
+    ``years_per_request`` sur ``download_glofas_discharge`` pour le
+    compromis).
     """
-    year = int(year)
-    if year < 1979 or year > date.today().year:
-        raise ValueError("year doit être compris entre 1979 et l'année courante")
+    if not years:
+        raise ValueError("years ne peut pas être vide")
+    for y in years:
+        if y < 1979 or y > date.today().year:
+            raise ValueError("year doit être compris entre 1979 et l'année courante")
     selected_months = _normalise_ints(months, 1, 12, "months")
     selected_area = _validate_area(area)
     if retries < 1:
@@ -175,55 +224,61 @@ def _download_glofas_discharge_year(
     destination.mkdir(parents=True, exist_ok=True)
     api = client or _make_client()
     extension = "zip" if download_format == "zip" else data_format
-    results: list[DownloadResult] = []
 
-    for month in selected_months:
-        target = destination / f"glofas_discharge_{year}_{month:02d}.{extension}"
-        partial = target.with_name(target.name + ".part")
-        if not overwrite and _is_complete(target, download_format):
-            LOG.info("[%d-%02d] déjà présent : %s", year, month, target)
-            results.append(DownloadResult(year, month, target, "skipped"))
-            continue
+    target = destination / _target_filename(years, selected_months, extension)
+    partial = target.with_name(target.name + ".part")
+    label = f"{years[0]}" if len(years) == 1 else f"{years[0]}-{years[-1]}"
 
-        days = [f"{day:02d}" for day in range(1, calendar.monthrange(year, month)[1] + 1)]
-        request = {
-            "system_version": [system_version],
-            "hydrological_model": [hydrological_model],
-            "product_type": [product_type],
-            "timespan": [timespan],
-            "variable": [variable],
-            "year": [str(year)],
-            "month": [f"{month:02d}"],
-            "day": days,
-            "data_format": data_format,
-            "download_format": download_format,
-            "area": list(selected_area),
-        }
+    if not overwrite and _is_complete(target, download_format):
+        LOG.info("[%s] déjà présent : %s", label, target)
+        return [DownloadResult(years[0], selected_months[0], target, "skipped", years[-1], selected_months[-1])]
 
-        for attempt in range(1, retries + 1):
-            try:
-                partial.unlink(missing_ok=True)
-                LOG.info("[%d-%02d] envoi (tentative %d/%d)", year, month, attempt, retries)
-                api.retrieve(DATASET, request, str(partial))
-                if not _is_complete(partial, download_format):
-                    raise RuntimeError("le fichier reçu est vide ou corrompu")
-                os.replace(partial, target)
-                LOG.info("[%d-%02d] terminé : %s", year, month, target)
-                results.append(DownloadResult(year, month, target, "downloaded"))
-                break
-            except Exception as exc:
-                partial.unlink(missing_ok=True)
-                if attempt == retries:
-                    LOG.exception("[%d-%02d] échec définitif", year, month)
-                    raise
-                wait = retry_delay * (2 ** (attempt - 1)) + random.uniform(0, retry_delay * 0.1)
-                LOG.warning(
-                    "[%d-%02d] échec temporaire (%s) ; nouvelle tentative dans %.1f s",
-                    year, month, exc, wait,
-                )
-                time.sleep(wait)
+    # Jours 1-31 pour tous les mois demandés (convention standard des requêtes
+    # CDS/EWDS portant sur plusieurs mois à la fois) : le serveur ignore
+    # silencieusement les combinaisons inexistantes (ex. 30 février) plutôt
+    # que de les rejeter -- pas besoin de calculer le nombre de jours exact
+    # par mois comme avec l'ancien découpage mensuel.
+    days = [f"{day:02d}" for day in range(1, 32)]
+    request = {
+        "system_version": [system_version],
+        "hydrological_model": [hydrological_model],
+        "product_type": [product_type],
+        "timespan": [timespan],
+        "variable": [variable],
+        "year": [str(y) for y in years],
+        "month": [f"{m:02d}" for m in selected_months],
+        "day": days,
+        "data_format": data_format,
+        "download_format": download_format,
+        "area": list(selected_area),
+    }
 
-    return results
+    for attempt in range(1, retries + 1):
+        try:
+            partial.unlink(missing_ok=True)
+            LOG.info(
+                "[%s] envoi (tentative %d/%d, %d année(s) x %d mois)",
+                label, attempt, retries, len(years), len(selected_months),
+            )
+            api.retrieve(DATASET, request, str(partial))
+            if not _is_complete(partial, download_format):
+                raise RuntimeError("le fichier reçu est vide ou corrompu")
+            os.replace(partial, target)
+            LOG.info("[%s] terminé : %s", label, target)
+            return [DownloadResult(years[0], selected_months[0], target, "downloaded", years[-1], selected_months[-1])]
+        except Exception as exc:
+            partial.unlink(missing_ok=True)
+            if attempt == retries:
+                LOG.exception("[%s] échec définitif", label)
+                raise
+            wait = retry_delay * (2 ** (attempt - 1)) + random.uniform(0, retry_delay * 0.1)
+            LOG.warning(
+                "[%s] échec temporaire (%s) ; nouvelle tentative dans %.1f s",
+                label, exc, wait,
+            )
+            time.sleep(wait)
+
+    return []  # inatteignable (la boucle ci-dessus retourne ou lève à chaque itération)
 
 
 def download_glofas_discharge(
@@ -239,6 +294,7 @@ def download_glofas_discharge(
     data_format: str = "grib",
     download_format: str = "zip",
     output_dir: str | os.PathLike[str] = "glofas_data",
+    years_per_request: int = 1,
     retries: int = 4,
     retry_delay: float = 30.0,
     pause_between_years: float = 5.0,
@@ -248,8 +304,33 @@ def download_glofas_discharge(
     """Télécharge une ou plusieurs années GLOFAS.
 
     ``year`` accepte une année seule ou tout itérable d'années, par exemple
-    ``1980``, ``[1980, 1981]`` ou ``range(1980, 1990)``. Les résultats mensuels
-    de toutes les années sont retournés dans une seule liste.
+    ``1980``, ``[1980, 1981]`` ou ``range(1980, 1990)``.
+
+    ``years_per_request`` (``1`` par défaut) regroupe les années
+    **consécutives** en une seule requête EWDS par groupe -- tous les mois
+    sélectionnés (``months``) pour toutes les années du groupe sont demandés
+    en un seul appel, au lieu d'une requête par mois comme avant. Même avec
+    la valeur par défaut (``1``), c'est déjà un gain important : une requête
+    par année plutôt que douze. Augmenter cette valeur (ex. ``5``) regroupe
+    plusieurs années dans une même requête et réduit encore le nombre total
+    de requêtes envoyées -- au prix d'une reprise moins fine en cas d'échec
+    (toute la requête est retentée, pas seulement l'année en cause) et d'une
+    requête plus volumineuse (risque accru de dépasser une limite de
+    taille/temps côté serveur -- à ajuster empiriquement ; commencez petit
+    et augmentez si ça passe). Les groupes ne franchissent jamais un trou
+    dans les années demandées (ex. ``year=[1980, 1981, 1985]`` avec
+    ``years_per_request=5`` donne les groupes ``[1980, 1981]`` et ``[1985]``,
+    pas un seul groupe de 1980 à 1985).
+
+    Si une requête échoue définitivement (toutes les tentatives épuisées),
+    le groupe correspondant est journalisé en erreur et le téléchargement
+    **continue** avec les groupes suivants (ne bloque pas tout le
+    téléchargement pour un seul groupe en échec, comme avant avec le
+    découpage par année) ; une erreur récapitulative est levée à la fin si
+    au moins un groupe a échoué, avec la liste des années concernées --
+    les groupes réussis restent téléchargés sur disque, relancer l'appel
+    reprend uniquement les groupes manquants (``overwrite=False`` par
+    défaut).
     """
     if isinstance(year, (int, str)):
         years = [int(year)]
@@ -258,41 +339,60 @@ def download_glofas_discharge(
             years = [int(value) for value in year]
         except (TypeError, ValueError) as exc:
             raise ValueError("year doit être une année ou un itérable d'années") from exc
+    years = sorted(set(years))
 
     if not years:
         raise ValueError("year ne peut pas être vide")
     if pause_between_years < 0:
         raise ValueError("pause_between_years ne peut pas être négatif")
+    if years_per_request < 1:
+        raise ValueError("years_per_request doit être supérieur ou égal à 1")
 
     # Matérialiser les mois une seule fois : un générateur doit rester utilisable
-    # pour chacune des années demandées.
+    # pour chacun des groupes d'années demandés.
     selected_months = list(months)
+    batches = _batch_years(years, years_per_request)
     api = client or _make_client()
     all_results: list[DownloadResult] = []
+    failed_batches: list[list[int]] = []
 
-    for index, selected_year in enumerate(years):
-        all_results.extend(
-            _download_glofas_discharge_year(
-                selected_year,
-                months=selected_months,
-                area=area,
-                system_version=system_version,
-                hydrological_model=hydrological_model,
-                product_type=product_type,
-                timespan=timespan,
-                variable=variable,
-                data_format=data_format,
-                download_format=download_format,
-                output_dir=output_dir,
-                retries=retries,
-                retry_delay=retry_delay,
-                overwrite=overwrite,
-                client=api,
+    for index, batch in enumerate(batches):
+        label = f"{batch[0]}" if len(batch) == 1 else f"{batch[0]}-{batch[-1]}"
+        try:
+            all_results.extend(
+                _download_glofas_discharge_batch(
+                    batch,
+                    months=selected_months,
+                    area=area,
+                    system_version=system_version,
+                    hydrological_model=hydrological_model,
+                    product_type=product_type,
+                    timespan=timespan,
+                    variable=variable,
+                    data_format=data_format,
+                    download_format=download_format,
+                    output_dir=output_dir,
+                    retries=retries,
+                    retry_delay=retry_delay,
+                    overwrite=overwrite,
+                    client=api,
+                )
             )
-        )
-        if index < len(years) - 1 and pause_between_years:
-            LOG.info("Pause de %.1f s avant l'année suivante", pause_between_years)
+        except Exception as exc:
+            LOG.error("[%s] groupe d'années en échec définitif : %s", label, exc)
+            failed_batches.append(batch)
+        if index < len(batches) - 1 and pause_between_years:
+            LOG.info("Pause de %.1f s avant le groupe d'années suivant", pause_between_years)
             time.sleep(pause_between_years)
+
+    if failed_batches:
+        failed_years = sorted(y for batch in failed_batches for y in batch)
+        raise RuntimeError(
+            f"Échec du téléchargement pour {len(failed_years)} année(s) : {failed_years} "
+            "(voir les logs ci-dessus pour le détail de chaque groupe). Les autres années "
+            "ont été téléchargées normalement ; relancez cet appel pour ne reprendre que "
+            "les groupes manquants (overwrite=False par défaut)."
+        )
 
     return all_results
 
@@ -321,9 +421,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--months", nargs="+", type=int, default=list(range(1, 13)))
     parser.add_argument("--area", nargs=4, type=float, metavar=("N", "W", "S", "E"), default=(90, -180, -60, 180))
     parser.add_argument("--output-dir", default="glofas_data")
+    parser.add_argument(
+        "--years-per-request", type=int, default=1,
+        help="nombre d'années consécutives regroupées par requête EWDS (1 = une requête par année, "
+             "déjà un gain net par rapport à l'ancien découpage mensuel ; augmenter réduit encore "
+             "le nombre de requêtes, au prix d'une reprise moins fine en cas d'échec)",
+    )
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--retry-delay", type=float, default=30.0)
-    parser.add_argument("--pause", type=float, default=5.0, help="pause entre deux années")
+    parser.add_argument("--pause", type=float, default=5.0, help="pause entre deux requêtes (groupes d'années)")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -338,6 +444,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.pause < 0:
         LOG.error("--pause ne peut pas être négatif")
         return 2
+    if args.years_per_request < 1:
+        LOG.error("--years-per-request doit être supérieur ou égal à 1")
+        return 2
 
     try:
         client = _make_client()
@@ -345,32 +454,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOG.error("%s", exc)
         return 2
 
-    downloaded = skipped = 0
-    failures: list[int] = []
-    for index, year in enumerate(args.years):
-        try:
-            results = download_glofas_discharge(
-                year,
-                months=args.months,
-                area=args.area,
-                output_dir=args.output_dir,
-                retries=args.retries,
-                retry_delay=args.retry_delay,
-                overwrite=args.overwrite,
-                client=client,
-            )
-            downloaded += sum(result.status == "downloaded" for result in results)
-            skipped += sum(result.status == "skipped" for result in results)
-        except Exception as exc:
-            LOG.error("[%d] année incomplète : %s", year, exc)
-            failures.append(year)
-        if index < len(args.years) - 1 and args.pause:
-            time.sleep(args.pause)
-
-    LOG.info("Résumé : %d téléchargé(s), %d ignoré(s), %d année(s) en échec", downloaded, skipped, len(failures))
-    if failures:
-        LOG.error("Années en échec : %s", ", ".join(map(str, failures)))
+    try:
+        results = download_glofas_discharge(
+            args.years,
+            months=args.months,
+            area=args.area,
+            output_dir=args.output_dir,
+            years_per_request=args.years_per_request,
+            retries=args.retries,
+            retry_delay=args.retry_delay,
+            pause_between_years=args.pause,
+            overwrite=args.overwrite,
+            client=client,
+        )
+    except RuntimeError as exc:
+        # download_glofas_discharge a déjà journalisé chaque groupe en échec ;
+        # ce message récapitule et déclenche un code de sortie non nul.
+        LOG.error("%s", exc)
         return 1
+
+    downloaded = sum(result.status == "downloaded" for result in results)
+    skipped = sum(result.status == "skipped" for result in results)
+    LOG.info("Résumé : %d requête(s) téléchargée(s), %d ignorée(s) (déjà présente(s))", downloaded, skipped)
     return 0
 
 
